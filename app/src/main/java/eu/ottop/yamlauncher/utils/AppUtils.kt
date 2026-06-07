@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
 import androidx.core.content.ContextCompat.getString
+import eu.ottop.yamlauncher.AppEntry
 import eu.ottop.yamlauncher.R
 import eu.ottop.yamlauncher.settings.SharedPreferenceManager
 import kotlinx.coroutines.Dispatchers
@@ -26,21 +27,24 @@ class AppUtils(private val context: Context, private val launcherApps: LauncherA
     private val logger = Logger.getInstance(context)
 
     /**
-     * Gets list of installed launchable apps.
+     * Gets list of installed launchable apps with pre-computed display names.
      * Includes apps from all user profiles (personal and work).
      * Filters out hidden apps unless showApps is true.
+     * Names are resolved once during construction for zero-cost reuse in sort/search/bind.
      *
      * @param showApps If true, includes hidden apps (used for shortcut selection)
-     * @return List of (LauncherActivityInfo, UserHandle, profileIndex) triples
+     * @return List of AppEntry objects with pre-computed display and search names
      * @suspend Must be called from coroutine context
      */
-    suspend fun getInstalledApps(showApps: Boolean = false): List<Triple<LauncherActivityInfo, UserHandle, Int>> {
-        val allApps = mutableListOf<Triple<LauncherActivityInfo, UserHandle, Int>>()
-        var sortedApps = listOf<Triple<LauncherActivityInfo, UserHandle, Int>>()
+    suspend fun getInstalledApps(showApps: Boolean = false): List<AppEntry> {
+        val stringUtils = StringUtils()
+        var sortedApps = listOf<AppEntry>()
         withContext(Dispatchers.Default) {
+            val rawApps = mutableListOf<AppEntry>()
             // Iterate through all user profiles (normal and work)
             for (i in launcherApps.profiles.indices) {
-                launcherApps.getActivityList(null, launcherApps.profiles[i]).forEach { app ->
+                val userHandle = launcherApps.profiles[i]
+                launcherApps.getActivityList(null, userHandle).forEach { app ->
                     // Include app if not hidden OR if showing hidden apps for shortcut selection
                     // Also exclude the launcher itself from the list
                     if ((!sharedPreferenceManager.isAppHidden(
@@ -48,59 +52,74 @@ class AppUtils(private val context: Context, private val launcherApps: LauncherA
                             i
                         ) or showApps)&& app.applicationInfo.packageName != context.applicationInfo.packageName
                     ) {
-                        // Store app info with profile index (i) to identify personal vs work profile
-                        allApps.add(Triple(app, launcherApps.profiles[i], i))
+                        val componentKey = app.componentName.flattenToString()
+                        val displayName = sharedPreferenceManager.getAppName(
+                            componentKey, i,
+                            AppNameResolver.resolveBaseLabel(context, app)
+                        ).toString()
+                        val cleaned = stringUtils.cleanString(displayName).orEmpty()
+
+                        rawApps.add(AppEntry(
+                            info = app,
+                            user = userHandle,
+                            profile = i,
+                            displayName = displayName,
+                            displayNameLower = displayName.lowercase(),
+                            cleanedName = cleaned,
+                            cleanedNameLower = cleaned.lowercase()
+                        ))
                     }
                 }
             }
 
-            // Sort apps: pinned apps first, then alphabetically by name
-            sortedApps = allApps.sortedWith(
-                compareBy<Triple<LauncherActivityInfo, UserHandle, Int>> {
-                    // Invert pinned status so pinned apps come first
-                    !sharedPreferenceManager.isAppPinned(it.first.componentName.flattenToString(), it.third)
+            sortedApps = rawApps.sortedWith(
+                compareBy<AppEntry> {
+                    !sharedPreferenceManager.isAppPinned(it.info.componentName.flattenToString(), it.profile)
                 }.thenBy {
-                // Then sort alphabetically (case-insensitive)
-                sharedPreferenceManager.getAppName(
-                    it.first.componentName.flattenToString(),
-                    it.third,
-                    AppNameResolver.resolveBaseLabel(context, it.first)
-                ).toString().lowercase()
+                    it.displayNameLower
                 }
             )
         }
         return sortedApps
-
     }
 
     /**
      * Gets list of hidden apps for the hidden apps settings screen.
      * Used to allow users to unhide apps.
      *
-     * @return List of hidden apps as (LauncherActivityInfo, UserHandle, profileIndex) triples
-     * @suspend Must be called from coroutine context
+     * @return List of hidden AppEntry objects
      */
-    suspend fun getHiddenApps(): List<Triple<LauncherActivityInfo, UserHandle, Int>> {
-        val allApps = mutableListOf<Triple<LauncherActivityInfo, UserHandle, Int>>()
-        var sortedApps = listOf<Triple<LauncherActivityInfo, UserHandle, Int>>()
+    suspend fun getHiddenApps(): List<AppEntry> {
+        val stringUtils = StringUtils()
+        var sortedApps = listOf<AppEntry>()
         withContext(Dispatchers.Default) {
-        for (i in launcherApps.profiles.indices) {
-            launcherApps.getActivityList(null, launcherApps.profiles[i]).forEach { app ->
-                // Only include apps that are marked as hidden
-                if (sharedPreferenceManager.isAppHidden(app.componentName.flattenToString(), i)) {
-                    allApps.add(Triple(app, launcherApps.profiles[i], i))
+            val rawApps = mutableListOf<AppEntry>()
+            for (i in launcherApps.profiles.indices) {
+                val userHandle = launcherApps.profiles[i]
+                launcherApps.getActivityList(null, userHandle).forEach { app ->
+                    // Only include apps that are marked as hidden
+                    if (sharedPreferenceManager.isAppHidden(app.componentName.flattenToString(), i)) {
+                        val componentKey = app.componentName.flattenToString()
+                        val displayName = sharedPreferenceManager.getAppName(
+                            componentKey, i,
+                            AppNameResolver.resolveBaseLabel(context, app)
+                        ).toString()
+
+                        rawApps.add(AppEntry(
+                            info = app,
+                            user = userHandle,
+                            profile = i,
+                            displayName = displayName,
+                            displayNameLower = displayName.lowercase(),
+                            cleanedName = stringUtils.cleanString(displayName).orEmpty(),
+                            cleanedNameLower = stringUtils.cleanString(displayName).orEmpty().lowercase()
+                        ))
+                    }
                 }
             }
-        }
 
         // Sort hidden apps alphabetically
-        sortedApps = allApps.sortedBy {
-        sharedPreferenceManager.getAppName(
-            it.first.componentName.flattenToString(),
-            it.third,
-            AppNameResolver.resolveBaseLabel(context, it.first)
-        ).toString().lowercase()
-        }
+            sortedApps = rawApps.sortedBy { it.displayNameLower }
         }
         return sortedApps
     }

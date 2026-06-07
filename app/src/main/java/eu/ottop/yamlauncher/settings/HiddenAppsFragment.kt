@@ -17,6 +17,7 @@ import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.textfield.TextInputEditText
+import eu.ottop.yamlauncher.AppEntry
 import eu.ottop.yamlauncher.utils.AppMenuEdgeFactory
 import eu.ottop.yamlauncher.R
 import eu.ottop.yamlauncher.utils.AppNameResolver
@@ -111,10 +112,10 @@ class HiddenAppsFragment : Fragment(), HiddenAppsAdapter.OnItemClickListener, Ti
     private suspend fun filterItems(query: String?) {
 
         val cleanQuery = stringUtils.cleanString(query)
-        val newFilteredApps = mutableListOf<Triple<LauncherActivityInfo, UserHandle, Int>>()
+        val newFilteredApps: List<AppEntry>
         val updatedApps = appUtils.getHiddenApps()
 
-        getFilteredApps(cleanQuery, newFilteredApps, updatedApps)
+        newFilteredApps = getFilteredApps(cleanQuery, updatedApps)
 
         applySearch(newFilteredApps)
 
@@ -123,35 +124,23 @@ class HiddenAppsFragment : Fragment(), HiddenAppsAdapter.OnItemClickListener, Ti
     /**
      * Applies fuzzy or exact matching filter.
      */
-    private fun getFilteredApps(cleanQuery: String?, newFilteredApps: MutableList<Triple<LauncherActivityInfo, UserHandle, Int>>, updatedApps: List<Triple<LauncherActivityInfo, UserHandle, Int>>) {
-        if (cleanQuery.isNullOrEmpty()) {
-            newFilteredApps.addAll(updatedApps)
+    private fun getFilteredApps(cleanQuery: String?, updatedApps: List<AppEntry>): List<AppEntry> {
+        if (cleanQuery.isNullOrEmpty()) return updatedApps
+
+        val queryLower = cleanQuery.lowercase()
+        val fuzzyPattern = if(sharedPreferenceManager.isFuzzySearchEnabled()) {
+            stringUtils.getFuzzyPattern(cleanQuery)
         } else {
-            val fuzzyPattern = if(sharedPreferenceManager.isFuzzySearchEnabled()) {
-                stringUtils.getFuzzyPattern(cleanQuery)
-            }
-            else {
-                null
-            }
-            updatedApps.forEach {
-                val cleanItemText = stringUtils.cleanString(sharedPreferenceManager.getAppName(
-                    it.first.componentName.flattenToString(),
-                    it.third,
-                    AppNameResolver.resolveBaseLabel(requireContext(), it.first)
-                ).toString())
-                if (cleanItemText != null) {
-                    if (
-                        (fuzzyPattern != null && cleanItemText.contains(fuzzyPattern)) ||
-                        (cleanItemText.contains(cleanQuery, ignoreCase = true))
-                    ) {
-                        newFilteredApps.add(it)
-                    }
-                }
-            }
+            null
+        }
+        return updatedApps.filter { entry ->
+            if (entry.cleanedName.isEmpty()) return@filter false
+            val fuzzyMatch = fuzzyPattern?.containsMatchIn(entry.cleanedName) == true
+            fuzzyMatch || entry.cleanedNameLower.contains(queryLower)
         }
     }
 
-    private fun applySearch(newFilteredApps: MutableList<Triple<LauncherActivityInfo, UserHandle, Int>>) {
+    private fun applySearch(newFilteredApps: List<AppEntry>) {
         adapter?.updateApps(newFilteredApps)
     }
 

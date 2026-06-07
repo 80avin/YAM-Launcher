@@ -23,10 +23,11 @@ import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.textfield.TextInputEditText
 import eu.ottop.yamlauncher.databinding.ActivityMainBinding
 import eu.ottop.yamlauncher.settings.SharedPreferenceManager
-import eu.ottop.yamlauncher.utils.AppNameResolver
 import eu.ottop.yamlauncher.utils.AppUtils
 import eu.ottop.yamlauncher.utils.Logger
 import eu.ottop.yamlauncher.utils.UIUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * RecyclerView adapter for displaying installed apps in the app menu.
@@ -40,8 +41,8 @@ import eu.ottop.yamlauncher.utils.UIUtils
  * - Accessibility actions
  */
 class AppDiffCallback(
-    private val oldList: List<Triple<LauncherActivityInfo, UserHandle, Int>>,
-    private val newList: List<Triple<LauncherActivityInfo, UserHandle, Int>>
+    private val oldList: List<AppEntry>,
+    private val newList: List<AppEntry>
 ) : DiffUtil.Callback() {
 
     override fun getOldListSize() = oldList.size
@@ -52,8 +53,8 @@ class AppDiffCallback(
      * Uses component name and profile index for comparison.
      */
     override fun areItemsTheSame(oldPos: Int, newPos: Int): Boolean {
-        return oldList[oldPos].first.componentName == newList[newPos].first.componentName &&
-               oldList[oldPos].third == newList[newPos].third
+        return oldList[oldPos].info.componentName == newList[newPos].info.componentName &&
+               oldList[oldPos].profile == newList[newPos].profile
     }
 
     /**
@@ -61,7 +62,7 @@ class AppDiffCallback(
      * Compares app labels for content changes.
      */
     override fun areContentsTheSame(oldPos: Int, newPos: Int): Boolean {
-        return oldList[oldPos].first.label == newList[newPos].first.label
+        return oldList[oldPos].displayName == newList[newPos].displayName
     }
 }
 
@@ -74,7 +75,7 @@ class AppDiffCallback(
 class AppMenuAdapter(
     private val activity: MainActivity,
     binding: ActivityMainBinding,
-    private var apps: MutableList<Triple<LauncherActivityInfo, UserHandle, Int>>,
+    private var apps: MutableList<AppEntry>,
     private val itemClickListener: OnItemClickListener,
     private val shortcutListener: OnShortcutListener,
     private val itemLongClickListener: OnItemLongClickListener,
@@ -188,15 +189,14 @@ class AppMenuAdapter(
                     return@setOnClickListener
                 }
                 val entry = apps[position]
-                val app = entry.first
 
                 // If in shortcut selection mode, assign to shortcut instead of launching
                 val localShortcut = shortcutTextView
                 if (localShortcut != null) {
-                    shortcutListener.onShortcut(app, entry.second, textView, entry.third, localShortcut, shortcutIndex)
+                    shortcutListener.onShortcut(entry.info, entry.user, textView, entry.profile, localShortcut, shortcutIndex)
                 }
                 else {
-                    itemClickListener.onItemClick(app, entry.second)
+                    itemClickListener.onItemClick(entry.info, entry.user)
                 }
             }
 
@@ -208,19 +208,18 @@ class AppMenuAdapter(
                 }
 
                 val entry = apps[position]
-                val app = entry.first
 
                 // In shortcut mode, long press also assigns
                 val localShortcut = shortcutTextView
                 if (localShortcut != null) {
-                    shortcutListener.onShortcut(app, entry.second, textView, entry.third, localShortcut, shortcutIndex)
+                    shortcutListener.onShortcut(entry.info, entry.user, textView, entry.profile, localShortcut, shortcutIndex)
                     return@setOnLongClickListener true
                 } else {
                     // Normal mode: show action menu
                     itemLongClickListener.onItemLongClick(
-                        app,
-                        entry.second,
-                        entry.third
+                        entry.info,
+                        entry.user,
+                        entry.profile
                     )
                     return@setOnLongClickListener true
                 }
@@ -243,11 +242,11 @@ class AppMenuAdapter(
         if (position >= apps.size) {
             return
         }
-        val app = apps[position]
+        val entry = apps[position]
 
         // Show pin icon for pinned apps
-        if (sharedPreferenceManager.isAppPinned(app.first.componentName.flattenToString(), app.third)) {
-            if (app.third != 0) {
+        if (sharedPreferenceManager.isAppPinned(entry.info.componentName.flattenToString(), entry.profile)) {
+            if (entry.profile != 0) {
                 // Pinned work profile app
                 holder.textView.setCompoundDrawablesWithIntrinsicBounds(drawablePinFilled, null, drawableEmpty, null)
             }
@@ -258,7 +257,7 @@ class AppMenuAdapter(
             holder.textView.compoundDrawables.getOrNull(0)?.colorFilter = BlendModeColorFilter(cachedTextColor, BlendMode.SRC_ATOP)
         }
         // Show work profile icon for non-pinned work apps
-        else if (app.third != 0) {
+        else if (entry.profile != 0) {
             holder.textView.setCompoundDrawablesWithIntrinsicBounds(drawableWork, null, drawableEmpty, null)
             holder.textView.compoundDrawables.getOrNull(0)?.colorFilter =
                 BlendModeColorFilter(cachedTextColor, BlendMode.SRC_ATOP)
@@ -283,19 +282,15 @@ class AppMenuAdapter(
 
         // Check if app is still installed (treats archived apps as installed)
         val isAppInstalled = appUtils.isAppInstalled(
-            app.first.applicationInfo.packageName,
-            app.third
+            entry.info.applicationInfo.packageName,
+            entry.profile
         )
 
         // Set app name or removal placeholder
         if (isAppInstalled) {
-            holder.textView.text = sharedPreferenceManager.getAppName(
-                app.first.componentName.flattenToString(),
-                app.third,
-                AppNameResolver.resolveBaseLabel(activity, app.first)
-            )
+            holder.textView.text = entry.displayName
             // Pre-fill edit text for rename mode
-            holder.editText.setText(holder.textView.text)
+            holder.editText.setText(entry.displayName)
         }
         else {
             holder.textView.text = activity.getString(R.string.removing)
@@ -323,16 +318,19 @@ class AppMenuAdapter(
 
     /**
      * Updates app list with DiffUtil for efficient animations.
-     * Preserves RecyclerView position when possible.
+     * Runs diff calculation on Dispatchers.Default to avoid blocking UI.
      *
      * @param newApps New list of apps
      */
-    fun updateApps(newApps: List<Triple<LauncherActivityInfo, UserHandle, Int>>) {
-        val diffCallback = AppDiffCallback(apps, newApps)
-        val diffResult = DiffUtil.calculateDiff(diffCallback)
-
-        apps = newApps.toMutableList()
-        diffResult.dispatchUpdatesTo(this)
+    suspend fun updateApps(newApps: List<AppEntry>) {
+        val oldApps = apps.toList()
+        val diffResult = withContext(Dispatchers.Default) {
+            DiffUtil.calculateDiff(AppDiffCallback(oldApps, newApps))
+        }
+        withContext(Dispatchers.Main) {
+            apps = newApps.toMutableList()
+            diffResult.dispatchUpdatesTo(this@AppMenuAdapter)
+        }
     }
 
     /**
@@ -342,7 +340,7 @@ class AppMenuAdapter(
      * @param newApps New list of apps
      */
     @SuppressLint("NotifyDataSetChanged")
-    fun setApps(newApps: List<Triple<LauncherActivityInfo, UserHandle, Int>>) {
+    fun setApps(newApps: List<AppEntry>) {
         apps = newApps.toMutableList()
         notifyDataSetChanged()
     }

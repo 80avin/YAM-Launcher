@@ -11,8 +11,8 @@ import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.core.content.res.ResourcesCompat
 import androidx.recyclerview.widget.RecyclerView
+import eu.ottop.yamlauncher.AppEntry
 import eu.ottop.yamlauncher.R
-import eu.ottop.yamlauncher.utils.AppNameResolver
 import eu.ottop.yamlauncher.utils.UIUtils
 
 /**
@@ -21,7 +21,7 @@ import eu.ottop.yamlauncher.utils.UIUtils
  */
 class HiddenAppsAdapter(
     private val context: Context,
-    private var apps: MutableList<Triple<LauncherActivityInfo, UserHandle, Int>>,
+    private var apps: MutableList<AppEntry>,
     private val itemClickListener: OnItemClickListener
 ) :
     RecyclerView.Adapter<HiddenAppsAdapter.AppViewHolder>() {
@@ -51,7 +51,7 @@ class HiddenAppsAdapter(
                     return@setOnClickListener
                 }
                 val appEntry = apps.getOrNull(position) ?: return@setOnClickListener
-                itemClickListener.onItemClick(appEntry.first, appEntry.third)
+                itemClickListener.onItemClick(appEntry.info, appEntry.profile)
             }
         }
     }
@@ -70,10 +70,10 @@ class HiddenAppsAdapter(
         if (position >= apps.size) {
             return
         }
-        val app = apps[position]
+        val entry = apps[position]
 
         // Show work profile indicator for work apps
-        if (app.third != 0) {
+        if (entry.profile != 0) {
             holder.textView.setCompoundDrawablesWithIntrinsicBounds(ResourcesCompat.getDrawable(context.resources,
                 R.drawable.ic_work_app, null),null,null,null)
         }
@@ -88,11 +88,7 @@ class HiddenAppsAdapter(
         uiUtils.setItemSpacing(holder.textView, sharedPreferenceManager.getAppSpacing())
 
         // Get app name (may have been renamed)
-        holder.textView.text = sharedPreferenceManager.getAppName(
-            app.first.componentName.flattenToString(),
-            app.third,
-            AppNameResolver.resolveBaseLabel(context, app.first)
-        )
+        holder.textView.text = entry.displayName
 
         holder.textView.visibility = View.VISIBLE
     }
@@ -107,7 +103,7 @@ class HiddenAppsAdapter(
      * @param newApps New list of hidden apps
      */
     @SuppressLint("NotifyDataSetChanged")
-    fun updateApps(newApps: List<Triple<LauncherActivityInfo, UserHandle, Int>>) {
+    fun updateApps(newApps: List<AppEntry>) {
         apps = newApps.toMutableList()
         notifyDataSetChanged()
     }

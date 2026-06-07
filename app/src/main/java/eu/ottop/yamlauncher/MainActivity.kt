@@ -21,10 +21,12 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.SearchManager
 import android.content.ActivityNotFoundException
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.LauncherActivityInfo
 import android.content.pm.LauncherApps
@@ -87,7 +89,6 @@ import eu.ottop.yamlauncher.tasks.ScreenLockService
 import eu.ottop.yamlauncher.utils.Animations
 import eu.ottop.yamlauncher.utils.AppMenuEdgeFactory
 import eu.ottop.yamlauncher.utils.AppMenuLinearLayoutManager
-import eu.ottop.yamlauncher.utils.AppNameResolver
 import eu.ottop.yamlauncher.utils.AppUtils
 import eu.ottop.yamlauncher.utils.BiometricUtils
 import eu.ottop.yamlauncher.utils.GestureUtils
@@ -162,8 +163,8 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var launcherApps: LauncherApps
-    private lateinit var installedApps: List<Triple<LauncherActivityInfo, UserHandle, Int>>
-    private var currentFilteredApps: List<Triple<LauncherActivityInfo, UserHandle, Int>> = listOf()
+    private lateinit var installedApps: List<AppEntry>
+    private var currentFilteredApps: List<AppEntry> = listOf()
 
     private lateinit var preferences: SharedPreferences
 
@@ -176,42 +177,28 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
     private var searchJob: Job? = null
     private var isResettingSearch = false
     private var isDrawerOpen = false
+    private var packageReceiver: BroadcastReceiver? = null
 
-    private data class AppSearchEntry(
-        val item: Triple<LauncherActivityInfo, UserHandle, Int>,
-        val cleaned: String,
-        val cleanedLower: String
-    )
-
-    private var appSearchIndex: List<AppSearchEntry> = emptyList()
-    private var appSearchIndexDirty = true
-
-    /**
-     * Builds a searchable index of installed apps with cleaned, lowercase names.
-     * This pre-computed index enables fast fuzzy search without repeated string processing.
-     *
-     * @param apps List of installed app information with user handles and profile indices
-     * @return List of search entries with original app data and cleaned name variants
-     */
-    private fun buildAppSearchIndex(apps: List<Triple<LauncherActivityInfo, UserHandle, Int>>): List<AppSearchEntry> {
-        return apps.mapNotNull { appItem ->
-            try {
-                val name = sharedPreferenceManager.getAppName(
-                    appItem.first.componentName.flattenToString(),
-                    appItem.third,
-                    AppNameResolver.resolveBaseLabel(this, appItem.first)
-                ).toString()
-
-                val cleaned = stringUtils.cleanString(name).orEmpty()
-                if (cleaned.isNotEmpty()) {
-                    AppSearchEntry(appItem, cleaned, cleaned.lowercase())
-                } else {
-                    null
+    private fun registerPackageReceiver() {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                lifecycleScope.launch {
+                    refreshAppMenu()
                 }
-            } catch (e: Exception) {
-                logger.w("MainActivity", "Error building search index for app: ${appItem.first.componentName.packageName}")
-                null
             }
+        }
+        packageReceiver = receiver
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addAction(Intent.ACTION_PACKAGE_REPLACED)
+            addAction(Intent.ACTION_PACKAGE_CHANGED)
+            addDataScheme("package")
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
         }
     }
 
@@ -254,15 +241,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
 
         setHomeListeners()
 
-        // Task to update the app menu every 5 seconds to detect newly installed/removed apps
-        lifecycleScope.launch {
-            lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-                while (true) {
-                    refreshAppMenu()
-                    delay(5000)
-                }
-            }
-        }
+        registerPackageReceiver()
 
         // Task to update the weather periodically based on configured interval
         lifecycleScope.launch(Dispatchers.IO) {
@@ -975,6 +954,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         isResettingSearch = true
         searchView.setText(R.string.empty)
         isResettingSearch = false
+        val wasSearchActive = isSearchActive
         isSearchActive = false
 
         closeKeyboard()
@@ -987,10 +967,8 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
                 appMenuLinearLayoutManager.setScrollEnabled(true)
                 if (::installedApps.isInitialized) {
                     currentFilteredApps = installedApps
-                    // Explicitly reset adapter to show full list
-                    lifecycleScope.launch {
-                        updateMenu(installedApps)
-                        refreshAppMenu()
+                    if (wasSearchActive) {
+                        appAdapter?.setApps(installedApps)
                     }
                 }
             } catch (e: Exception) {
@@ -1016,7 +994,6 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
                     // Atomic update - assign once
                     installedApps = updatedApps
                     currentFilteredApps = updatedApps
-                    appSearchIndexDirty = true
 
                     if (::alphabetIndex.isInitialized && sharedPreferenceManager.isAlphabetIndexEnabled()) {
                         refreshAlphabetIndex(currentFilteredApps)
@@ -1029,13 +1006,13 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
     }
 
     private fun listsEqual(
-        list1: List<Triple<LauncherActivityInfo, UserHandle, Int>>,
-        list2: List<Triple<LauncherActivityInfo, UserHandle, Int>>
+        list1: List<AppEntry>,
+        list2: List<AppEntry>
     ): Boolean {
         if (list1.size != list2.size) return false
 
         for (i in list1.indices) {
-            if (list1[i].first.componentName != list2[i].first.componentName || list1[i].second != list2[i].second) {
+            if (list1[i].info.componentName != list2[i].info.componentName || list1[i].user != list2[i].user) {
                 return false
             }
         }
@@ -1043,7 +1020,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         return true
     }
 
-    private suspend fun updateMenu(updatedApps: List<Triple<LauncherActivityInfo, UserHandle, Int>>) {
+    private suspend fun updateMenu(updatedApps: List<AppEntry>) {
         withContext(Dispatchers.Main) {
             if (isSearchActive) {
                 appAdapter?.setApps(updatedApps)
@@ -1082,10 +1059,6 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
             currentFilteredApps = installedApps
             val newApps = installedApps.toMutableList()
 
-            // Pre-build search index so the first keystroke doesn't hitch.
-            appSearchIndex = buildAppSearchIndex(installedApps)
-            appSearchIndexDirty = false
-
             setupAppRecycler(newApps)
 
             setupSearch()
@@ -1111,7 +1084,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         }
     }
 
-    private fun refreshAlphabetIndex(apps: List<Triple<LauncherActivityInfo, UserHandle, Int>>) {
+    private fun refreshAlphabetIndex(apps: List<AppEntry>) {
         val availableLetters = buildAlphabetIndexLetters(apps)
         alphabetIndex.post {
             if (!sharedPreferenceManager.isAlphabetIndexEnabled() || menuView.displayedChild != 0) {
@@ -1126,20 +1099,11 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         }
     }
 
-    private fun buildAlphabetIndexLetters(apps: List<Triple<LauncherActivityInfo, UserHandle, Int>>): Set<String> {
+    private fun buildAlphabetIndexLetters(apps: List<AppEntry>): Set<String> {
         val availableLetters = mutableSetOf<String>()
         for (app in apps) {
-            try {
-                val name = sharedPreferenceManager.getAppName(
-                    app.first.componentName.flattenToString(),
-                    app.third,
-                    AppNameResolver.resolveBaseLabel(this, app.first)
-                ).toString()
-                if (name.isNotEmpty()) {
-                    availableLetters.add(getAlphabetIndexKey(name))
-                }
-            } catch (e: Exception) {
-                logger.w("MainActivity", "Error getting app name for alphabet index: ${app.first.componentName.packageName}")
+            if (app.displayName.isNotEmpty()) {
+                availableLetters.add(getAlphabetIndexKey(app.displayName))
             }
         }
         return availableLetters
@@ -1167,31 +1131,21 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         alphabetIndex.layoutParams = layoutParams
     }
 
-    private fun scrollToLetter(letter: String, apps: List<Triple<LauncherActivityInfo, UserHandle, Int>>) {
+    private fun scrollToLetter(letter: String, apps: List<AppEntry>) {
         val targetLetter = if (letter == "#") null else letter
 
         var targetPosition = -1
         for (i in apps.indices) {
             val app = apps.getOrNull(i) ?: continue
-            try {
-                val name = sharedPreferenceManager.getAppName(
-                    app.first.componentName.flattenToString(),
-                    app.third,
-                    AppNameResolver.resolveBaseLabel(this, app.first)
-                ).toString()
-
-                val letterKey = getAlphabetIndexKey(name)
-                if (targetLetter == null) {
-                    if (letterKey == "#") {
-                        targetPosition = i
-                        break
-                    }
-                } else if (letterKey == targetLetter) {
+            val letterKey = getAlphabetIndexKey(app.displayName)
+            if (targetLetter == null) {
+                if (letterKey == "#") {
                     targetPosition = i
                     break
                 }
-            } catch (e: Exception) {
-                logger.w("MainActivity", "Error in scrollToLetter for app at position $i")
+            } else if (letterKey == targetLetter) {
+                targetPosition = i
+                break
             }
         }
 
@@ -1216,7 +1170,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         }
     }
 
-    private suspend fun setupAppRecycler(newApps: MutableList<Triple<LauncherActivityInfo, UserHandle, Int>>) {
+    private suspend fun setupAppRecycler(newApps: MutableList<AppEntry>) {
         appAdapter = AppMenuAdapter(this@MainActivity, binding, newApps, this@MainActivity, this@MainActivity, this@MainActivity, launcherApps)
         appMenuLinearLayoutManager.stackFromEnd = true
         appRecycler = binding.appRecycler
@@ -1391,7 +1345,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
     }
 
     private data class FilterResult(
-        val filteredApps: List<Triple<LauncherActivityInfo, UserHandle, Int>>?,
+        val filteredApps: List<AppEntry>?,
         val isEmptyQuery: Boolean
     )
 
@@ -1409,9 +1363,8 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         when (displayedChild) {
             0 -> {
                 if (!::installedApps.isInitialized) return
-                val appsToFilter = installedApps
                 val result = withContext(Dispatchers.Default) {
-                    getFilteredApps(cleanQuery, appsToFilter)
+                    getFilteredApps(cleanQuery, installedApps)
                 }
                 withContext(Dispatchers.Main) {
                     if (result.isEmptyQuery) {
@@ -1443,59 +1396,44 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
      * @param updatedApps List of apps to filter through
      * @return FilterResult containing prioritized matching apps or empty query indicator
      */
-    private suspend fun getFilteredApps(
+    private fun getFilteredApps(
         cleanQuery: String?,
-        updatedApps: List<Triple<LauncherActivityInfo, UserHandle, Int>>
+        updatedApps: List<AppEntry>
     ): FilterResult {
         if (cleanQuery.isNullOrEmpty()) {
             return FilterResult(null, true)
-        } else {
-            if (appSearchIndexDirty || appSearchIndex.size != updatedApps.size) {
-                appSearchIndex = buildAppSearchIndex(updatedApps)
-                appSearchIndexDirty = false
-            }
-
-            val queryLower = cleanQuery.lowercase()
-
-            val fuzzyPattern = if (sharedPreferenceManager.isFuzzySearchEnabled()) {
-                stringUtils.getFuzzyPattern(cleanQuery)
-            } else {
-                null
-            }
-
-            val exactMatches = mutableListOf<Triple<LauncherActivityInfo, UserHandle, Int>>()
-            val otherMatches = mutableListOf<Triple<LauncherActivityInfo, UserHandle, Int>>()
-
-            //List containing apps whose name starts with the specified query
-            val startWithMatches = mutableListOf<Triple<LauncherActivityInfo, UserHandle, Int>>()
-
-            for (entry in appSearchIndex) {
-                if (entry.cleaned.isEmpty()) continue
-
-                val fuzzyMatch = fuzzyPattern?.containsMatchIn(entry.cleaned) == true
-                val contains = entry.cleanedLower.contains(queryLower)
-                if (!contains && !fuzzyMatch) continue
-
-                // Each matching app is placed into a priority bucket based on how closely it matches the query
-                when{
-                    entry.cleanedLower == queryLower -> exactMatches.add(entry.item)
-                    entry.cleanedLower.startsWith(queryLower) -> startWithMatches.add(entry.item)
-                    else -> otherMatches.add(entry.item)
-                }
-
-            }
-
-            // Results are ordered in the following order:
-            // 1. exactMatches - app name that is equal to the query
-            // 2. startWithMatches - app name starts with the query
-            // 3. otherMatches - app name contains the query
-            // -- Within each bucket the alphabetic order is preserved --
-            return FilterResult(exactMatches + startWithMatches + otherMatches, false)
         }
+
+        val queryLower = cleanQuery.lowercase()
+
+        val fuzzyPattern = if (sharedPreferenceManager.isFuzzySearchEnabled()) {
+            stringUtils.getFuzzyPattern(cleanQuery)
+        } else {
+            null
+        }
+
+        val exactMatches = mutableListOf<AppEntry>()
+        val startWithMatches = mutableListOf<AppEntry>()
+        val otherMatches = mutableListOf<AppEntry>()
+
+        for (entry in updatedApps) {
+            if (entry.cleanedName.isEmpty()) continue
+
+            val fuzzyMatch = fuzzyPattern?.containsMatchIn(entry.cleanedName) == true
+            val contains = entry.cleanedNameLower.contains(queryLower)
+            if (!contains && !fuzzyMatch) continue
+
+            when {
+                entry.cleanedNameLower == queryLower -> exactMatches.add(entry)
+                entry.cleanedNameLower.startsWith(queryLower) -> startWithMatches.add(entry)
+                else -> otherMatches.add(entry)
+            }
+        }
+
+        return FilterResult(exactMatches + startWithMatches + otherMatches, false)
     }
 
-    private suspend fun applySearchFilter(newFilteredApps: List<Triple<LauncherActivityInfo, UserHandle, Int>>) {
-        // Guard against uninitialized views - check before accessing
+    private suspend fun applySearchFilter(newFilteredApps: List<AppEntry>) {
         val shouldAutoLaunch = if (::menuView.isInitialized && ::appRecycler.isInitialized) {
             sharedPreferenceManager.isAutoLaunchEnabled() && menuView.displayedChild == 0 && appAdapter?.shortcutTextView == null && newFilteredApps.size == 1
         } else {
@@ -1503,7 +1441,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         }
         
         if (shouldAutoLaunch) {
-            appUtils.launchApp(newFilteredApps[0].first.componentName, newFilteredApps[0].second)
+            appUtils.launchApp(newFilteredApps[0].info.componentName, newFilteredApps[0].user)
         } else {
             updateMenu(newFilteredApps)
             currentFilteredApps = newFilteredApps
@@ -1600,6 +1538,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         try {
             unregisterBatteryReceiver()
             unregisterNotificationReceiver()
+            packageReceiver?.let { unregisterReceiver(it) }
             preferences.unregisterOnSharedPreferenceChangeListener(this)
             searchJob?.cancel()
         } catch (e: Exception) {
@@ -1940,10 +1879,9 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
                     workProfile,
                     newName
                 )
-                appSearchIndexDirty = true
                 logger.i("MainActivity", "App renamed from '${appActivity.label}' to '$newName'")
                 lifecycleScope.launch {
-                    applySearch()
+                    refreshAppMenu()
                 }
                 enableAppMenuScroll()
 
@@ -1968,10 +1906,9 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
                 appActivity.componentName.flattenToString(),
                 workProfile
             )
-            appSearchIndexDirty = true
 
             lifecycleScope.launch {
-                applySearch()
+                refreshAppMenu()
             }
         }
     }
@@ -1979,8 +1916,8 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
     private fun findAppPosition(appActivity: LauncherActivityInfo, workProfile: Int): Int {
         val appsToSearch = currentFilteredApps
         for (i in 0 until appsToSearch.size) {
-            val tuple = appsToSearch.getOrNull(i)
-            if (tuple?.first?.componentName == appActivity.componentName && tuple.third == workProfile) {
+            val entry = appsToSearch.getOrNull(i)
+            if (entry?.info?.componentName == appActivity.componentName && entry.profile == workProfile) {
                 return i
             }
         }
