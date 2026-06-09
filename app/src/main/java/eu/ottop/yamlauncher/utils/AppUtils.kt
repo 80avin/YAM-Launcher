@@ -25,6 +25,28 @@ class AppUtils(private val context: Context, private val launcherApps: LauncherA
 
     private val sharedPreferenceManager = SharedPreferenceManager(context)
     private val logger = Logger.getInstance(context)
+    private val stringUtils = StringUtils()
+
+    /**
+     * Builds a single AppEntry with pre-computed display and search names.
+     */
+    private fun buildAppEntry(app: LauncherActivityInfo, userHandle: UserHandle, profile: Int): AppEntry {
+        val componentKey = app.componentName.flattenToString()
+        val displayName = sharedPreferenceManager.getAppName(
+            componentKey, profile,
+            AppNameResolver.resolveBaseLabel(context, app)
+        ).toString()
+        val cleaned = stringUtils.cleanString(displayName).orEmpty()
+        return AppEntry(
+            info = app,
+            user = userHandle,
+            profile = profile,
+            displayName = displayName,
+            displayNameLower = displayName.lowercase(),
+            cleanedName = cleaned,
+            cleanedNameLower = cleaned.lowercase()
+        )
+    }
 
     /**
      * Gets list of installed launchable apps with pre-computed display names.
@@ -37,7 +59,6 @@ class AppUtils(private val context: Context, private val launcherApps: LauncherA
      * @suspend Must be called from coroutine context
      */
     suspend fun getInstalledApps(showApps: Boolean = false): List<AppEntry> {
-        val stringUtils = StringUtils()
         var sortedApps = listOf<AppEntry>()
         withContext(Dispatchers.Default) {
             val rawApps = mutableListOf<AppEntry>()
@@ -52,22 +73,7 @@ class AppUtils(private val context: Context, private val launcherApps: LauncherA
                             i
                         ) or showApps)&& app.applicationInfo.packageName != context.applicationInfo.packageName
                     ) {
-                        val componentKey = app.componentName.flattenToString()
-                        val displayName = sharedPreferenceManager.getAppName(
-                            componentKey, i,
-                            AppNameResolver.resolveBaseLabel(context, app)
-                        ).toString()
-                        val cleaned = stringUtils.cleanString(displayName).orEmpty()
-
-                        rawApps.add(AppEntry(
-                            info = app,
-                            user = userHandle,
-                            profile = i,
-                            displayName = displayName,
-                            displayNameLower = displayName.lowercase(),
-                            cleanedName = cleaned,
-                            cleanedNameLower = cleaned.lowercase()
-                        ))
+                        rawApps.add(buildAppEntry(app, userHandle, i))
                     }
                 }
             }
@@ -90,7 +96,6 @@ class AppUtils(private val context: Context, private val launcherApps: LauncherA
      * @return List of hidden AppEntry objects
      */
     suspend fun getHiddenApps(): List<AppEntry> {
-        val stringUtils = StringUtils()
         var sortedApps = listOf<AppEntry>()
         withContext(Dispatchers.Default) {
             val rawApps = mutableListOf<AppEntry>()
@@ -99,26 +104,12 @@ class AppUtils(private val context: Context, private val launcherApps: LauncherA
                 launcherApps.getActivityList(null, userHandle).forEach { app ->
                     // Only include apps that are marked as hidden
                     if (sharedPreferenceManager.isAppHidden(app.componentName.flattenToString(), i)) {
-                        val componentKey = app.componentName.flattenToString()
-                        val displayName = sharedPreferenceManager.getAppName(
-                            componentKey, i,
-                            AppNameResolver.resolveBaseLabel(context, app)
-                        ).toString()
-
-                        rawApps.add(AppEntry(
-                            info = app,
-                            user = userHandle,
-                            profile = i,
-                            displayName = displayName,
-                            displayNameLower = displayName.lowercase(),
-                            cleanedName = stringUtils.cleanString(displayName).orEmpty(),
-                            cleanedNameLower = stringUtils.cleanString(displayName).orEmpty().lowercase()
-                        ))
+                        rawApps.add(buildAppEntry(app, userHandle, i))
                     }
                 }
             }
 
-        // Sort hidden apps alphabetically
+            // Sort hidden apps alphabetically
             sortedApps = rawApps.sortedBy { it.displayNameLower }
         }
         return sortedApps

@@ -89,6 +89,7 @@ import eu.ottop.yamlauncher.tasks.ScreenLockService
 import eu.ottop.yamlauncher.utils.Animations
 import eu.ottop.yamlauncher.utils.AppMenuEdgeFactory
 import eu.ottop.yamlauncher.utils.AppMenuLinearLayoutManager
+import eu.ottop.yamlauncher.utils.AppNameResolver
 import eu.ottop.yamlauncher.utils.AppUtils
 import eu.ottop.yamlauncher.utils.BiometricUtils
 import eu.ottop.yamlauncher.utils.GestureUtils
@@ -178,12 +179,24 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
     private var isResettingSearch = false
     private var isDrawerOpen = false
     private var packageReceiver: BroadcastReceiver? = null
+    private var refreshJob: Job? = null
 
     private fun registerPackageReceiver() {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
-                lifecycleScope.launch {
-                    refreshAppMenu()
+                val action = intent.action
+                // Skip component-level changes that don't affect app list
+                if (action == Intent.ACTION_PACKAGE_CHANGED) {
+                    return
+                }
+                refreshJob?.cancel()
+                refreshJob = lifecycleScope.launch {
+                    if (action == Intent.ACTION_PACKAGE_REMOVED) {
+                        // Let the adapter re-bind so the user briefly sees "Removing..."
+                        // before the app is removed from the list.
+                        delay(500)
+                    }
+                    reloadAppList()
                 }
             }
         }
@@ -192,7 +205,6 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
             addAction(Intent.ACTION_PACKAGE_ADDED)
             addAction(Intent.ACTION_PACKAGE_REMOVED)
             addAction(Intent.ACTION_PACKAGE_REPLACED)
-            addAction(Intent.ACTION_PACKAGE_CHANGED)
             addDataScheme("package")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -384,7 +396,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
             if (sharedPreferenceManager.showHiddenShortcuts()) {
                 lifecycleScope.launch(Dispatchers.Default) {
                     showHidden = true
-                    refreshAppMenu()
+                    reloadAppList()
                     runOnUiThread {
                         toAppMenu() // This is intentionally slow to happen
                     }
@@ -983,40 +995,36 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         imm.hideSoftInputFromWindow(binding.root.windowToken, 0)
     }
 
-    suspend fun refreshAppMenu() {
+    /**
+     * Rebuilds the app list from package manager and refreshes the display.
+     * Does NOT trigger auto-launch. Safe to call from background events.
+     */
+    suspend fun reloadAppList() {
+        if (!::installedApps.isInitialized) return
         try {
-            // Don't reset app menu while under a search
-            if (!isSearchActive && ::installedApps.isInitialized) {
-                val updatedApps = appUtils.getInstalledApps(showHidden)
-                // Use structural equality check and atomic update pattern
-                if (installedApps.isEmpty() || !listsEqual(installedApps, updatedApps)) {
-                    updateMenu(updatedApps)
-                    // Atomic update - assign once
-                    installedApps = updatedApps
-                    currentFilteredApps = updatedApps
-
-                    if (::alphabetIndex.isInitialized && sharedPreferenceManager.isAlphabetIndexEnabled()) {
-                        refreshAlphabetIndex(currentFilteredApps)
-                    }
+            val updatedApps = appUtils.getInstalledApps(showHidden)
+            if (!listsEqual(installedApps, updatedApps)) {
+                installedApps = updatedApps
+                if (isSearchActive) {
+                    filterItems(searchView.text.toString(), allowAutoLaunch = false)
+                } else {
+                    currentFilteredApps = installedApps
+                    updateMenu(installedApps)
+                    refreshAlphabetIndex(currentFilteredApps)
                 }
             }
         } catch (e: Exception) {
-            logger.w("MainActivity", "Error in refreshAppMenu: ${e.message}")
+            logger.w("MainActivity", "Error in reloadAppList: ${e.message}")
         }
     }
 
-    private fun listsEqual(
-        list1: List<AppEntry>,
-        list2: List<AppEntry>
-    ): Boolean {
+    private fun listsEqual(list1: List<AppEntry>, list2: List<AppEntry>): Boolean {
         if (list1.size != list2.size) return false
-
         for (i in list1.indices) {
-            if (list1[i].info.componentName != list2[i].info.componentName || list1[i].user != list2[i].user) {
+            if (list1[i].info.componentName != list2[i].info.componentName || list1[i].profile != list2[i].profile) {
                 return false
             }
         }
-
         return true
     }
 
@@ -1230,7 +1238,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
             // Cancel any ongoing search job when switching views
             searchJob?.cancel()
             withContext(Dispatchers.Default) {
-                filterItems(searchView.text.toString())
+                filterItems(searchView.text.toString(), allowAutoLaunch = false)
             }
         }
         searchSwitcher.setImageDrawable(
@@ -1249,7 +1257,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
             // Cancel any ongoing search job when switching views
             searchJob?.cancel()
             withContext(Dispatchers.Default) {
-                filterItems(searchView.text.toString())
+                filterItems(searchView.text.toString(), allowAutoLaunch = false)
             }
         }
         searchSwitcher.setImageDrawable(ResourcesCompat.getDrawable(resources, R.drawable.apps_24px, null))
@@ -1337,7 +1345,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
                         delay(16) // Wait for reset to complete
                     }
                     withContext(Dispatchers.Default) {
-                        filterItems(s.toString())
+                        filterItems(s.toString(), allowAutoLaunch = true)
                     }
                 }
             }
@@ -1356,9 +1364,8 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
      *
      * @param query The search string to filter by
      */
-    private suspend fun filterItems(query: String?) {
+    private suspend fun filterItems(query: String?, allowAutoLaunch: Boolean = false) {
         val cleanQuery = stringUtils.cleanString(query)
-        // Guard against uninitialized menuView
         val displayedChild = if (::menuView.isInitialized) menuView.displayedChild else 0
         when (displayedChild) {
             0 -> {
@@ -1374,7 +1381,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
                         refreshAlphabetIndex(currentFilteredApps)
                     } else if (result.filteredApps != null) {
                         isSearchActive = true
-                        applySearchFilter(result.filteredApps)
+                        applySearchFilter(result.filteredApps, allowAutoLaunch)
                     }
                 }
             }
@@ -1433,12 +1440,12 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         return FilterResult(exactMatches + startWithMatches + otherMatches, false)
     }
 
-    private suspend fun applySearchFilter(newFilteredApps: List<AppEntry>) {
-        val shouldAutoLaunch = if (::menuView.isInitialized && ::appRecycler.isInitialized) {
+    private suspend fun applySearchFilter(newFilteredApps: List<AppEntry>, allowAutoLaunch: Boolean) {
+        val shouldAutoLaunch = allowAutoLaunch && (if (::menuView.isInitialized && ::appRecycler.isInitialized) {
             sharedPreferenceManager.isAutoLaunchEnabled() && menuView.displayedChild == 0 && appAdapter?.shortcutTextView == null && newFilteredApps.size == 1
         } else {
             false
-        }
+        })
         
         if (shouldAutoLaunch) {
             appUtils.launchApp(newFilteredApps[0].info.componentName, newFilteredApps[0].user)
@@ -1451,14 +1458,6 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
             if (::appRecycler.isInitialized) {
                 appRecycler.scrollToPosition(0)
             }
-        }
-    }
-
-    suspend fun applySearch() {
-        // Cancel any ongoing search job
-        searchJob?.cancel()
-        withContext(Dispatchers.Default) {
-            filterItems(searchView.text.toString())
         }
     }
 
@@ -1541,6 +1540,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
             packageReceiver?.let { unregisterReceiver(it) }
             preferences.unregisterOnSharedPreferenceChangeListener(this)
             searchJob?.cancel()
+            refreshJob?.cancel()
         } catch (e: Exception) {
             logger.w("MainActivity", "Error during onDestroy cleanup: ${e.message}")
         }
@@ -1662,6 +1662,10 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
             backToHome(0)
         }
         returnAllowed = true
+
+        // Re-bind adapter so apps that were uninstalled while the launcher was in the
+        // background show "Removing..." before the broadcast receiver coroutine rebuilds
+        // the list.
         appAdapter?.notifyDataSetChanged()
 
         updateNotificationDots()
@@ -1758,7 +1762,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         val isPinned = sharedPreferenceManager.isAppPinned(componentName, workProfile)
         logger.i("MainActivity", "App ${appActivity.label} ${if (isPinned) "pinned" else "unpinned"}")
         lifecycleScope.launch {
-            refreshAppMenu()
+            reloadAppList()
         }
     }
 
@@ -1839,16 +1843,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
 
             // If the keyboard is closed, exit editing mode
             if (bottom - top > oldBottom - oldTop) {
-                editLayout.clearFocus()
-
-                animations.fadeViewOut(editLayout)
-                animations.fadeViewIn(textView)
-                if (searchEnabled) {
-                    searchView.visibility = View.VISIBLE
-                } else {
-                    searchView.visibility = View.GONE
-                }
-                enableAppMenuScroll()
+                exitRenameMode(editLayout, textView, searchEnabled)
 
                 // Remove the listener and clear the reference
                 renameLayoutListener?.let { listener ->
@@ -1870,26 +1865,28 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
                     Toast.makeText(this@MainActivity, getString(R.string.empty_rename), Toast.LENGTH_SHORT).show()
                     return@setOnEditorActionListener true
                 }
-                val imm =
-                    getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                imm.hideSoftInputFromWindow(editText.windowToken, 0)
                 val newName = editText.text.toString()
                 sharedPreferenceManager.setAppName(
                     appActivity.componentName.flattenToString(),
                     workProfile,
                     newName
                 )
+                textView.text = newName
                 logger.i("MainActivity", "App renamed from '${appActivity.label}' to '$newName'")
                 lifecycleScope.launch {
-                    refreshAppMenu()
+                    reloadAppList()
                 }
-                enableAppMenuScroll()
 
-                // Remove the layout listener when done
+                // Remove listener before hiding keyboard to prevent double exitRenameMode
                 renameLayoutListener?.let { listener ->
                     binding.root.removeOnLayoutChangeListener(listener)
                 }
                 renameLayoutListener = null
+
+                val imm =
+                    getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                imm.hideSoftInputFromWindow(editText.windowToken, 0)
+                exitRenameMode(editLayout, textView, searchEnabled)
 
                 return@setOnEditorActionListener true
             }
@@ -1899,18 +1896,40 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         resetButton.setOnClickListener {
 
             // If reset is pressed, close keyboard, remove saved edited name and update the apps on screen
-            val imm =
-                getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-            imm.hideSoftInputFromWindow(editText.windowToken, 0)
             sharedPreferenceManager.resetAppName(
                 appActivity.componentName.flattenToString(),
                 workProfile
             )
-
+            val originalName = AppNameResolver.resolveBaseLabel(this@MainActivity, appActivity)
+            textView.text = originalName
+            logger.i("MainActivity", "App name reset to '$originalName'")
             lifecycleScope.launch {
-                refreshAppMenu()
+                reloadAppList()
             }
+
+            // Remove listener before hiding keyboard to prevent double exitRenameMode
+            renameLayoutListener?.let { listener ->
+                binding.root.removeOnLayoutChangeListener(listener)
+            }
+            renameLayoutListener = null
+
+            val imm =
+                getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.hideSoftInputFromWindow(editText.windowToken, 0)
+            exitRenameMode(editLayout, textView, searchEnabled)
         }
+    }
+
+    private fun exitRenameMode(editLayout: LinearLayout, textView: TextView, searchEnabled: Boolean) {
+        editLayout.clearFocus()
+        animations.fadeViewOut(editLayout)
+        animations.fadeViewIn(textView)
+        if (searchEnabled) {
+            searchView.visibility = View.VISIBLE
+        } else {
+            searchView.visibility = View.GONE
+        }
+        enableAppMenuScroll()
     }
 
     private fun findAppPosition(appActivity: LauncherActivityInfo, workProfile: Int): Int {
@@ -1928,7 +1947,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         logger.i("MainActivity", "Hiding app: ${appActivity.label}")
         lifecycleScope.launch {
             sharedPreferenceManager.setAppHidden(appActivity.componentName.flattenToString(), workProfile, true)
-            refreshAppMenu()
+            reloadAppList()
         }
     }
 
